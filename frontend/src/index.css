@@ -1,0 +1,23 @@
+@import "tailwindcss";
+
+@theme {
+    --color-athens-primary: #3b82f6;
+    --color-athens-secondary: #1e40af;
+    --color-athens-accent: #60a5fa;
+    --color-athens-light: #eff6ff;
+    --color-athens-dark: #1e3a8a;
+}
+
+@layer components {
+    .btn-primary {
+        @apply bg-athens-dark text-white font-bold py-2 px-4 rounded hover:bg-athens-secondary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-athens-accent/50 transition-colors;
+    }
+
+    .btn-secondary {
+        @apply bg-athens-light text-athens-dark font-bold py-2 px-4 rounded hover:bg-gray-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-athens-accent/50 transition-colors;
+    }
+
+    .input-field {
+        @apply w-full px-3 py-2 border border-gray-300 rounded focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-athens-accent;
+    }
+}
