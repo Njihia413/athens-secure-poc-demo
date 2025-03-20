@@ -5,6 +5,8 @@ import axios from 'axios';
 const API_URL = 'http://localhost:5000/api';
 
 const Auth = () => {
+    const [firstName, setFirstName] = useState('');
+    const [lastName, setLastName] = useState('');
     const [username, setUsername] = useState('');
     const [password, setPassword] = useState('');
     const [message, setMessage] = useState('');
@@ -29,8 +31,16 @@ const Auth = () => {
         e.preventDefault();
         resetMessages();
 
+        // Validate all fields are present
+        if (!firstName || !lastName || !username || !password) {
+            setError('All fields are required');
+            return;
+        }
+
         try {
             const response = await axios.post(`${API_URL}/register`, {
+                firstName,
+                lastName,
                 username,
                 password
             });
@@ -54,7 +64,12 @@ const Auth = () => {
             });
 
             setMessage(response.data.message);
-            setCurrentUser({ id: response.data.user_id, username });
+            setCurrentUser({
+                id: response.data.user_id,
+                username,
+                firstName: response.data.firstName,
+                lastName: response.data.lastName
+            });
             setUseFido(response.data.has_security_key);  // Set based on server response
         } catch (err) {
             setError(err.response?.data?.error || 'Login failed');
@@ -152,7 +167,12 @@ const Auth = () => {
             console.log('Authentication complete response:', loginCompleteResponse.data);
 
             setMessage('Login successful with security key!');
-            setCurrentUser({ id: loginCompleteResponse.data.user_id, username });
+            setCurrentUser({
+                id: loginCompleteResponse.data.user_id,
+                username,
+                firstName: loginCompleteResponse.data.firstName,
+                lastName: loginCompleteResponse.data.lastName
+            });
             setUseFido(true);  // If they logged in with WebAuthn, they definitely have a security key
         } catch (err) {
             console.error('WebAuthn authentication error:', err);
@@ -164,12 +184,28 @@ const Auth = () => {
         }
     };
 
+    // Handle database reset
+    const handleResetDb = async () => {
+        try {
+            const response = await axios.post(`${API_URL}/reset-db`);
+            setMessage(response.data.message);
+            // Log out if currently logged in
+            if (currentUser) {
+                handleLogout();
+            }
+        } catch (err) {
+            setError(err.response?.data?.error || 'Failed to reset database');
+        }
+    };
+
     // Logout
     const handleLogout = () => {
         setCurrentUser(null);
         setMessage('Logged out successfully');
         setUsername('');
         setPassword('');
+        setFirstName('');
+        setLastName('');
     };
 
     return (
@@ -179,7 +215,7 @@ const Auth = () => {
             {currentUser ? (
                 <div className="space-y-4">
                     <div className="p-4 bg-athens-light rounded">
-                        <p className="text-athens-dark font-medium">Logged in as: {currentUser.username}</p>
+                        <p className="text-athens-dark font-medium">Logged in as: {currentUser.firstName} {currentUser.lastName} ({currentUser.username})</p>
                     </div>
 
                     {!useFido && (
@@ -208,6 +244,28 @@ const Auth = () => {
                         <div>
                             <h2 className="text-xl font-semibold mb-4">Register</h2>
                             <form onSubmit={handleRegister} className="space-y-4">
+                                <div>
+                                    <label htmlFor="first-name" className="block text-sm font-medium text-gray-700 mb-1">First Name</label>
+                                    <input
+                                        id="first-name"
+                                        type="text"
+                                        value={firstName}
+                                        onChange={(e) => setFirstName(e.target.value)}
+                                        className="input-field"
+                                        required
+                                    />
+                                </div>
+                                <div>
+                                    <label htmlFor="last-name" className="block text-sm font-medium text-gray-700 mb-1">Last Name</label>
+                                    <input
+                                        id="last-name"
+                                        type="text"
+                                        value={lastName}
+                                        onChange={(e) => setLastName(e.target.value)}
+                                        className="input-field"
+                                        required
+                                    />
+                                </div>
                                 <div>
                                     <label htmlFor="reg-username" className="block text-sm font-medium text-gray-700 mb-1">Username</label>
                                     <input
@@ -315,6 +373,18 @@ const Auth = () => {
                     {error}
                 </div>
             )}
+
+            {/* Database Reset Button (for development only) */}
+            {/*<div className="mt-8 pt-4 border-t border-gray-300">*/}
+            {/*    <p className="text-xs text-gray-500 mb-2">Admin Functions (Development Only)</p>*/}
+            {/*    <button*/}
+            {/*        onClick={handleResetDb}*/}
+            {/*        className="w-full bg-red-500 text-white font-bold py-2 px-4 rounded hover:bg-red-600 focus:outline-none focus:ring-2 focus:ring-red-300 transition-colors"*/}
+            {/*    >*/}
+            {/*        Reset Database*/}
+            {/*    </button>*/}
+            {/*    <p className="text-xs text-gray-500 mt-1">Warning: This will delete all user data</p>*/}
+            {/*</div>*/}
         </div>
     );
 };
