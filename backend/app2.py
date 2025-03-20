@@ -40,9 +40,11 @@ Session(app)
 db = SQLAlchemy(app)
 
 
-# User model
-class User(db.Model):
+# User model renamed to Users and with additional fields
+class Users(db.Model):
     id = db.Column(db.Integer, primary_key=True)
+    first_name = db.Column(db.String(100), nullable=False)  # Added first name
+    last_name = db.Column(db.String(100), nullable=False)  # Added last name
     username = db.Column(db.String(100), unique=True, nullable=False)
     password_hash = db.Column(db.String(200), nullable=True)  # Optional for passwordless auth
 
@@ -58,15 +60,15 @@ class User(db.Model):
         return check_password_hash(self.password_hash, password)
 
 
-# Add this model to your existing models
+# Update WebAuthnChallenge model to reference Users instead of User
 class WebAuthnChallenge(db.Model):
     id = db.Column(db.Integer, primary_key=True)
-    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
     challenge = db.Column(db.String(255), nullable=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     expired = db.Column(db.Boolean, default=False)
 
-    user = db.relationship('User', backref=db.backref('challenges', lazy=True))
+    user = db.relationship('Users', backref=db.backref('challenges', lazy=True))
 
 
 # Configure WebAuthn
@@ -80,18 +82,24 @@ def health_check():
     return jsonify({'status': 'ok', 'message': 'Athens AI Auth Server Running'})
 
 
-# Routes for traditional authentication (username/password)
+# Updated route for user registration with first and last name
 @app.route('/api/register', methods=['POST'])
 def register():
     data = request.get_json()
 
-    if not data or not data.get('username') or not data.get('password'):
-        return jsonify({'error': 'Missing username or password'}), 400
+    # Check if all required fields are provided
+    if not data or not data.get('username') or not data.get('password') or \
+            not data.get('firstName') or not data.get('lastName'):
+        return jsonify({'error': 'Missing required fields (firstName, lastName, username, or password)'}), 400
 
-    if User.query.filter_by(username=data['username']).first():
+    if Users.query.filter_by(username=data['username']).first():
         return jsonify({'error': 'Username already exists'}), 409
 
-    user = User(username=data['username'])
+    user = Users(
+        first_name=data['firstName'],
+        last_name=data['lastName'],
+        username=data['username']
+    )
     user.set_password(data['password'])
 
     db.session.add(user)
@@ -107,7 +115,7 @@ def login():
     if not data or not data.get('username') or not data.get('password'):
         return jsonify({'error': 'Missing username or password'}), 400
 
-    user = User.query.filter_by(username=data['username']).first()
+    user = Users.query.filter_by(username=data['username']).first()
 
     if not user or not user.check_password(data['password']):
         return jsonify({'error': 'Invalid username or password'}), 401
@@ -119,6 +127,8 @@ def login():
     return jsonify({
         'message': 'Login successful',
         'user_id': user.id,
+        'firstName': user.first_name,
+        'lastName': user.last_name,
         'has_security_key': has_security_key
     }), 200
 
@@ -130,7 +140,6 @@ def base64url_to_bytes(base64url):
     base64_str = base64url.replace('-', '+').replace('_', '/')
     padding = '=' * ((4 - len(base64_str) % 4) % 4)  # Correct padding
     return base64.b64decode(base64_str + padding)
-
 
 
 def bytes_to_base64url(bytes_data):
@@ -151,21 +160,41 @@ def webauthn_register_begin():
         return jsonify({'error': 'Username required'}), 400
 
     # Check if user exists
-    user = User.query.filter_by(username=username).first()
+    user = Users.query.filter_by(username=username).first()
     if not user:
         return jsonify({'error': 'User not found'}), 404
+
+    # Get all existing credential IDs from the database
+    # This is for the excludeCredentials parameter to prevent
+    # registering the same security key multiple times
+    all_credentials = []
+    users_with_credentials = Users.query.filter(Users.credential_id.isnot(None)).all()
+
+    for existing_user in users_with_credentials:
+        try:
+            credential_id = websafe_decode(existing_user.credential_id)
+            all_credentials.append(
+                PublicKeyCredentialDescriptor(
+                    type=PublicKeyCredentialType.PUBLIC_KEY,
+                    id=credential_id
+                )
+            )
+        except Exception as e:
+            print(f"Error decoding credential ID: {e}")
+            continue
 
     # Prepare registration options
     user_entity = PublicKeyCredentialUserEntity(
         id=str(user.id).encode('utf-8'),
         name=username,
-        display_name=username
+        display_name=f"{user.first_name} {user.last_name}"  # Use full name for display_name
     )
 
-    # Get registration data from the server
+    # Get registration data from the server, now including all existing credentials
+    # to exclude them from being registered again
     registration_data, state = server.register_begin(
         user_entity,
-        credentials=[],  # No existing credentials for the user
+        credentials=all_credentials,  # Exclude existing credentials
         user_verification=UserVerificationRequirement.PREFERRED,
         authenticator_attachment=AuthenticatorAttachment.CROSS_PLATFORM
     )
@@ -210,6 +239,14 @@ def webauthn_register_begin():
     user_id_bytes = str(user.id).encode('utf-8')
     user_id_base64url = base64.b64encode(user_id_bytes).decode('utf-8').replace('+', '-').replace('/', '_').rstrip('=')
 
+    # Prepare exclude credentials list for client
+    exclude_credentials = []
+    for cred in all_credentials:
+        exclude_credentials.append({
+            'type': 'public-key',
+            'id': websafe_encode(cred.id)
+        })
+
     # Return the publicKey options as expected by the WebAuthn API
     return jsonify({
         'publicKey': {
@@ -220,7 +257,7 @@ def webauthn_register_begin():
             'user': {
                 'id': user_id_base64url,
                 'name': username,
-                'displayName': username
+                'displayName': f"{user.first_name} {user.last_name}"  # Use full name for display
             },
             'challenge': challenge_base64url,
             'pubKeyCredParams': [
@@ -228,7 +265,7 @@ def webauthn_register_begin():
                 {'type': 'public-key', 'alg': -257}  # RS256
             ],
             'timeout': 60000,
-            'excludeCredentials': [],
+            'excludeCredentials': exclude_credentials,  # Add this to prevent reregistration
             'authenticatorSelection': {
                 'authenticatorAttachment': 'cross-platform',
                 'userVerification': 'preferred'
@@ -248,7 +285,7 @@ def webauthn_register_complete():
     if not username:
         return jsonify({'error': 'Username required'}), 400
 
-    user = User.query.filter_by(username=username).first()
+    user = Users.query.filter_by(username=username).first()
     if not user:
         return jsonify({'error': 'User not found'}), 404
 
@@ -315,7 +352,9 @@ def webauthn_register_complete():
         except Exception as e:
             raise ValueError(f"🚨 Failed to parse AttestationObject: {str(e)}")
 
-        client_data_obj['challenge'] = client_data_obj['challenge'].decode() if isinstance(client_data_obj['challenge'], bytes) else client_data_obj['challenge']
+        client_data_obj['challenge'] = client_data_obj['challenge'].decode() if isinstance(client_data_obj['challenge'],
+                                                                                           bytes) else client_data_obj[
+            'challenge']
 
         client_data_json_fixed = json.dumps(client_data_obj)
         client_data = CollectedClientData(client_data_json_fixed.encode('utf-8'))
@@ -338,11 +377,22 @@ def webauthn_register_complete():
             auth_data = server.register_complete(state, client_data, attestation_obj)
             print("Registration successful!")
 
+            # Mark the challenge as expired
             challenge_record.expired = True
             db.session.commit()
 
-            # ✅ Fix: Store credential information correctly
+            # Extract the credential ID from the auth_data
             credential_id = websafe_encode(auth_data.credential_data.credential_id)
+
+            # Check if this credential ID is already registered to another user
+            existing_user = Users.query.filter(Users.credential_id == credential_id).first()
+            if existing_user:
+                return jsonify({
+                    'error': 'Security key already registered',
+                    'detail': 'This security key is already registered to another account.'
+                }), 400
+
+            # Store credential information
             public_key = cbor.encode(auth_data.credential_data.public_key)
             sign_count = auth_data.counter
 
@@ -364,8 +414,6 @@ def webauthn_register_complete():
         return jsonify({'error': str(e)}), 400
 
 
-
-
 # WebAuthn authentication endpoints
 @app.route('/api/webauthn/login/begin', methods=['POST'])
 def webauthn_login_begin():
@@ -376,7 +424,7 @@ def webauthn_login_begin():
         return jsonify({'error': 'Username required'}), 400
 
     # Find user
-    user = User.query.filter_by(username=username).first()
+    user = Users.query.filter_by(username=username).first()
     if not user or not user.credential_id:
         return jsonify({'error': 'User not found or no security key registered'}), 404
 
@@ -459,7 +507,7 @@ def webauthn_login_complete():
         return jsonify({'error': 'Username required'}), 400
 
     # Find user
-    user = User.query.filter_by(username=username).first()
+    user = Users.query.filter_by(username=username).first()
     if not user:
         return jsonify({'error': 'User not found'}), 404
 
@@ -507,6 +555,8 @@ def webauthn_login_complete():
             'status': 'success',
             'message': 'Authentication successful',
             'user_id': user.id,
+            'firstName': user.first_name,
+            'lastName': user.last_name,
             'has_security_key': True  # If they logged in with WebAuthn, they definitely have a security key
         })
 
@@ -515,6 +565,20 @@ def webauthn_login_complete():
         import traceback
         print(traceback.format_exc())
         return jsonify({'error': str(e)}), 400
+
+
+# Note to reset the database
+# When changing models, you'll need to drop and recreate all tables
+@app.route('/api/reset-db', methods=['POST'])
+def reset_db():
+    try:
+        # This is dangerous and should be protected/removed in production!
+        db.drop_all()
+        db.create_all()
+        return jsonify({'message': 'Database reset successfully'}), 200
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 
 # At the bottom of your app.py file, before `if __name__ == '__main__':`
 with app.app_context():
