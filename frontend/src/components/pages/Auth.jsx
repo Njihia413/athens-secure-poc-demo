@@ -14,6 +14,7 @@ const Auth = () => {
     const [isRegistered, setIsRegistered] = useState(false);
     const [currentUser, setCurrentUser] = useState(null);
     const [useFido, setUseFido] = useState(false);
+    const [keyRegistering, setKeyRegistering] = useState(false);
 
     const resetMessages = () => {
         setMessage('');
@@ -79,9 +80,11 @@ const Auth = () => {
     // WebAuthn Registration
     const handleWebAuthnRegister = async () => {
         resetMessages();
+        setKeyRegistering(true);
 
         if (!currentUser) {
             setError('Please login with username/password first to register your security key');
+            setKeyRegistering(false);
             return;
         }
 
@@ -100,6 +103,7 @@ const Auth = () => {
             const options = registerBeginResponse.data.publicKey;
 
             console.log('Server-sent challenge:', options.challenge);
+            console.log('Excluded credentials:', options.excludeCredentials);
 
             // Step 2: Call WebAuthn browser API
             const attestation = await startRegistration(options);
@@ -133,7 +137,19 @@ const Auth = () => {
             }
         } catch (err) {
             console.error('WebAuthn registration error:', err);
-            setError(err.response?.data?.error || 'Security key registration failed');
+
+            // Be more specific about NotAllowedError, which usually indicates
+            // that the security key is already registered
+            if (err.name === 'NotAllowedError') {
+                setError('This security key appears to be already registered to an account. Each security key can only be registered to one account for maximum security.');
+            } else if (err.name === 'AbortError') {
+                setError('Security key registration was cancelled by the user.');
+            } else {
+                setError(err.response?.data?.error || 'Security key registration failed: ' + (err.message || err.name));
+                //console.log('Error set to:', error);
+            }
+        } finally {
+            setKeyRegistering(false);
         }
     };
 
@@ -178,6 +194,8 @@ const Auth = () => {
             console.error('WebAuthn authentication error:', err);
             if (err.name === 'AbortError') {
                 setError('Authentication was aborted, possibly because you cancelled it');
+            } else if (err.name === 'NotAllowedError') {
+                setError('Authentication was not allowed. Did you use the correct security key?');
             } else {
                 setError(err.response?.data?.error || 'Security key authentication failed');
             }
@@ -206,6 +224,7 @@ const Auth = () => {
         setPassword('');
         setFirstName('');
         setLastName('');
+        setUseFido(false);
     };
 
     return (
@@ -225,9 +244,11 @@ const Auth = () => {
                             <button
                                 onClick={handleWebAuthnRegister}
                                 className="btn-primary w-full"
+                                disabled={keyRegistering}
                             >
-                                Register Security Key
+                                {keyRegistering ? 'Registering...' : 'Register Security Key'}
                             </button>
+                            <p className="text-xs text-gray-500 mt-2">Each security key can only be registered to one account for maximum security.</p>
                         </div>
                     )}
 
