@@ -1,0 +1,3 @@
+"id","first_name","last_name","username","password_hash","credential_id","public_key","sign_count"
+1,"Maureen","Njihia","Njihia413","scrypt:32768:8:1$KOwsQk9cbp7g1Kta$ed70b16fd4b6a096600df551c3be882c50484d3cdc562884d4463bb5bd61ccd5076e7a2aa00d0ef8d961f6e97b24c61439fd19d6715da6f9ea2ed38004c456ad","et4FE8PIQscFZTelhWdBCIejCvPS65shRNNQ0YBFklMBN5d66Uioo-1-EvsJufWuQ5MCPPCWvMSW8C80weJ-Pw","pQECAyYgASFYIIaH85TpbQVVM2JwA4sa01qFeO/jWx9wv2uOTsEkA/b7Ilggpn5ZKU+EuDByX9NGqP9loXF3VmgimzusTeoMQpFOHr8=",6
+2,"Rhoda","Njuki","Rhosh","scrypt:32768:8:1$z1lXe3I6jkM4tSwd$ea3994778e1e9210ca40d44a63e6cb07b549e845f3acd024dfd541f1995433e8bd4068e8a42398188026a54d988b3c54dddb5b147ab60d3cce40bf8545b48dba",NULL,NULL,0
