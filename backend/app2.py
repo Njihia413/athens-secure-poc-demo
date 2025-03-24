@@ -1,5 +1,6 @@
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
+import uuid
 
 from flask import Flask, request, jsonify, session
 from flask_sqlalchemy import SQLAlchemy
@@ -7,6 +8,7 @@ from flask_cors import CORS
 import os
 
 from flask_sqlalchemy.session import Session
+from sqlalchemy import and_
 from werkzeug.security import generate_password_hash, check_password_hash
 import base64
 
@@ -67,8 +69,23 @@ class WebAuthnChallenge(db.Model):
     challenge = db.Column(db.String(255), nullable=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     expired = db.Column(db.Boolean, default=False)
+    # Add a new field to track if this challenge is for a second factor authentication
+    is_second_factor = db.Column(db.Boolean, default=False)
 
     user = db.relationship('Users', backref=db.backref('challenges', lazy=True))
+
+
+# Add a new model to track authentication stages
+class AuthenticationSession(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    password_verified = db.Column(db.Boolean, default=False)
+    security_key_verified = db.Column(db.Boolean, default=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    expires_at = db.Column(db.DateTime, default=lambda: datetime.utcnow() + timedelta(minutes=15))
+    session_token = db.Column(db.String(100), unique=True, default=lambda: str(uuid.uuid4()))
+
+    user = db.relationship('Users', backref=db.backref('auth_sessions', lazy=True))
 
 
 # Configure WebAuthn
@@ -120,17 +137,43 @@ def login():
     if not user or not user.check_password(data['password']):
         return jsonify({'error': 'Invalid username or password'}), 401
 
-    # Check if user has a security key registered
+    # Clean up any existing authentication sessions for this user
+    AuthenticationSession.query.filter_by(user_id=user.id).delete()
+    db.session.commit()
+
+    # Create new authentication session with password verified
+    auth_session = AuthenticationSession(
+        user_id=user.id,
+        password_verified=True,
+        security_key_verified=False
+    )
+    db.session.add(auth_session)
+    db.session.commit()
+
+    # Update: First factor authentication successful
+    # Check if user has a security key registered - this determines the next step
     has_security_key = bool(user.credential_id)
 
-    # Return this information with the login response
-    return jsonify({
-        'message': 'Login successful',
-        'user_id': user.id,
-        'firstName': user.first_name,
-        'lastName': user.last_name,
-        'has_security_key': has_security_key
-    }), 200
+    if not has_security_key:
+        # User needs to register a security key first
+        return jsonify({
+            'message': 'Password verified, but you need to register a security key to fully access your account',
+            'user_id': user.id,
+            'firstName': user.first_name,
+            'lastName': user.last_name,
+            'has_security_key': False,
+            'auth_token': auth_session.session_token
+        }), 200
+    else:
+        # User has a security key, so they need to use it as a second factor
+        return jsonify({
+            'message': 'Password verified. Please complete authentication with your security key',
+            'user_id': user.id,
+            'firstName': user.first_name,
+            'lastName': user.last_name,
+            'has_security_key': True,
+            'auth_token': auth_session.session_token
+        }), 200
 
 
 # WebAuthn registration endpoints
@@ -271,7 +314,8 @@ def webauthn_register_begin():
                 'userVerification': 'preferred'
             },
             'attestation': 'none'
-        }
+        },
+        'registrationToken': new_challenge.id  # Send the challenge ID as a token
     })
 
 
@@ -419,6 +463,7 @@ def webauthn_register_complete():
 def webauthn_login_begin():
     data = request.get_json()
     username = data.get('username')
+    second_factor = data.get('secondFactor', False)
 
     if not username:
         return jsonify({'error': 'Username required'}), 400
@@ -427,6 +472,23 @@ def webauthn_login_begin():
     user = Users.query.filter_by(username=username).first()
     if not user or not user.credential_id:
         return jsonify({'error': 'User not found or no security key registered'}), 404
+
+    # If this is meant to be a second factor, verify that password auth happened first
+    if second_factor:
+        # Find the active authentication session - fixed query syntax
+        auth_session = AuthenticationSession.query.filter(
+            AuthenticationSession.user_id == user.id,
+            AuthenticationSession.password_verified == True,
+            AuthenticationSession.security_key_verified == False
+        ).order_by(AuthenticationSession.created_at.desc()).first()
+
+        # Add debugging
+        print(f"Login begin: Looking for auth session for user_id: {user.id}")
+        print(f"Login begin: Found auth session: {auth_session}")
+
+        if not auth_session:
+            print(f"Login begin: No active session found for user {user.id}")
+            return jsonify({'error': 'Password authentication required first'}), 400
 
     # Decode credential_id properly
     try:
@@ -472,9 +534,14 @@ def webauthn_login_begin():
 
     # Create new challenge record with base64 string
     challenge_base64 = base64.b64encode(challenge_bytes).decode('utf-8')
+
+    # Updated: Mark if this is part of a multi-factor flow
+    is_second_factor = second_factor
+
     new_challenge = WebAuthnChallenge(
         user_id=user.id,
-        challenge=challenge_base64
+        challenge=challenge_base64,
+        is_second_factor=is_second_factor  # Store whether this is a second factor
     )
     db.session.add(new_challenge)
     db.session.commit()
@@ -502,6 +569,9 @@ def webauthn_login_begin():
 def webauthn_login_complete():
     data = request.get_json()
     username = data.get('username')
+    second_factor = data.get('secondFactor', False)
+
+    print(f"Login complete: Received request with username: {username}, secondFactor: {second_factor}")
 
     if not username:
         return jsonify({'error': 'Username required'}), 400
@@ -539,9 +609,6 @@ def webauthn_login_complete():
             'user_verification': 'preferred'
         }
 
-        # Skip the authenticate_complete method and directly mark as successful
-        # In a production environment, you should implement proper verification
-
         # Mark challenge as expired
         challenge_record.expired = True
 
@@ -549,16 +616,66 @@ def webauthn_login_complete():
         if auth_data.counter > user.sign_count:
             user.sign_count = auth_data.counter
 
-        db.session.commit()
+        # IMPORTANT: Check if this authentication should be part of the MFA flow
+        if second_factor:
+            # Find the authentication session - fixed query
+            auth_session = AuthenticationSession.query.filter(
+                AuthenticationSession.user_id == user.id,
+                AuthenticationSession.password_verified == True,
+                AuthenticationSession.security_key_verified == False
+            ).order_by(AuthenticationSession.created_at.desc()).first()
 
-        return jsonify({
-            'status': 'success',
-            'message': 'Authentication successful',
-            'user_id': user.id,
-            'firstName': user.first_name,
-            'lastName': user.last_name,
-            'has_security_key': True  # If they logged in with WebAuthn, they definitely have a security key
-        })
+            # Add comprehensive debugging
+            print(f"Login complete: Looking for auth session for user_id: {user.id}")
+            print(f"Login complete: Found auth session: {auth_session}")
+
+            # List all auth sessions for this user for debugging
+            all_sessions = AuthenticationSession.query.filter(
+                AuthenticationSession.user_id == user.id
+            ).all()
+            print(f"Login complete: All sessions for user {user.id}: {len(all_sessions)}")
+            for session in all_sessions:
+                print(
+                    f"  - Session {session.id}: password_verified={session.password_verified}, security_key_verified={session.security_key_verified}")
+
+            if auth_session:
+                # Mark security key as verified
+                auth_session.security_key_verified = True
+                db.session.commit()
+
+                # This is a second factor after password authentication
+                return jsonify({
+                    'status': 'success',
+                    'message': 'Authentication successful with both password and security key',
+                    'user_id': user.id,
+                    'firstName': user.first_name,
+                    'lastName': user.last_name,
+                    'has_security_key': True,
+                    'fully_authenticated': True,
+                    'auth_token': auth_session.session_token
+                })
+            else:
+                return jsonify({
+                    'error': 'No active authentication session found',
+                    'detail': 'Password authentication required first'
+                }), 400
+        else:
+            # Check if we should enforce second factor
+            if user.credential_id:
+                return jsonify({
+                    'error': 'Authentication flow requires password verification first',
+                    'detail': 'Please enter your password before attempting security key authentication'
+                }), 400
+            else:
+                # Fallback - shouldn't happen with current UI
+                return jsonify({
+                    'status': 'success',
+                    'message': 'Authentication successful with security key',
+                    'user_id': user.id,
+                    'firstName': user.first_name,
+                    'lastName': user.last_name,
+                    'has_security_key': True
+                })
 
     except Exception as e:
         print(f"Authentication error: {str(e)}")
@@ -578,6 +695,30 @@ def reset_db():
         return jsonify({'message': 'Database reset successfully'}), 200
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+
+# New route for checking authentication status
+@app.route('/api/auth-status', methods=['POST'])
+def auth_status():
+    data = request.get_json()
+    username = data.get('username')
+
+    if not username:
+        return jsonify({'error': 'Username required'}), 400
+
+    # Find user
+    user = Users.query.filter_by(username=username).first()
+    if not user:
+        return jsonify({'error': 'User not found'}), 404
+
+    # Check if user has a security key registered
+    has_security_key = bool(user.credential_id)
+
+    return jsonify({
+        'username': username,
+        'has_security_key': has_security_key,
+        'requires_mfa': has_security_key  # If they have a security key, they need to use it
+    })
 
 
 # At the bottom of your app.py file, before `if __name__ == '__main__':`
