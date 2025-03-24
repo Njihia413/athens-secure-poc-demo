@@ -15,6 +15,8 @@ const Auth = () => {
     const [currentUser, setCurrentUser] = useState(null);
     const [useFido, setUseFido] = useState(false);
     const [keyRegistering, setKeyRegistering] = useState(false);
+    const [pendingSecondFactor, setPendingSecondFactor] = useState(false);
+    const [passwordAuthenticated, setPasswordAuthenticated] = useState(false);
 
     const resetMessages = () => {
         setMessage('');
@@ -53,27 +55,51 @@ const Auth = () => {
         }
     };
 
-    // Traditional Login
+    // First factor authentication with username/password
     const handleLogin = async (e) => {
         e.preventDefault();
         resetMessages();
 
         try {
+            console.log('Attempting password login for username:', username);
+
             const response = await axios.post(`${API_URL}/login`, {
                 username,
                 password
             });
 
-            setMessage(response.data.message);
-            setCurrentUser({
-                id: response.data.user_id,
-                username,
-                firstName: response.data.firstName,
-                lastName: response.data.lastName
-            });
-            setUseFido(response.data.has_security_key);  // Set based on server response
+            console.log('Password login response:', response.data);
+
+            // Check if the user has a security key registered
+            if (response.data.has_security_key) {
+                // Store partial authentication state
+                setPasswordAuthenticated(true);
+                setPendingSecondFactor(true);
+                setMessage('Password verified. Please use your security key to complete login.');
+
+                console.log('Password verified, security key required. States updated:', {
+                    passwordAuthenticated: true,
+                    pendingSecondFactor: true
+                });
+
+                // Use the separate function for second factor that doesn't depend on state
+                handleWebAuthnLoginAfterPassword();
+            } else {
+                // If user doesn't have a security key registered, show a different message
+                setMessage('Password verified, but you need to register a security key to access your account.');
+                setPasswordAuthenticated(true);
+
+                // Store user info for security key registration
+                setCurrentUser({
+                    id: response.data.user_id,
+                    username,
+                    firstName: response.data.firstName,
+                    lastName: response.data.lastName
+                });
+            }
         } catch (err) {
             setError(err.response?.data?.error || 'Login failed');
+            setPasswordAuthenticated(false);
         }
     };
 
@@ -146,21 +172,23 @@ const Auth = () => {
                 setError('Security key registration was cancelled by the user.');
             } else {
                 setError(err.response?.data?.error || 'Security key registration failed: ' + (err.message || err.name));
-                //console.log('Error set to:', error);
             }
         } finally {
             setKeyRegistering(false);
         }
     };
 
-    // WebAuthn Login
+    // Standard WebAuthn authentication (should not be called directly in MFA flow)
     const handleWebAuthnLogin = async () => {
         resetMessages();
 
         try {
             // Step 1: Begin authentication
+            console.log('Sending WebAuthn login begin request with passwordAuthenticated =', passwordAuthenticated);
+
             const loginBeginResponse = await axios.post(`${API_URL}/webauthn/login/begin`, {
-                username
+                username,
+                secondFactor: passwordAuthenticated
             });
 
             console.log('Authentication begin response:', loginBeginResponse.data);
@@ -175,21 +203,31 @@ const Auth = () => {
             console.log('Authentication response:', assertion);
 
             // Step 3: Complete authentication on the server
+            console.log('Sending WebAuthn login complete request with passwordAuthenticated =', passwordAuthenticated);
+
             const loginCompleteResponse = await axios.post(`${API_URL}/webauthn/login/complete`, {
                 username,
-                assertionResponse: assertion
+                assertionResponse: assertion,
+                secondFactor: passwordAuthenticated
             });
 
             console.log('Authentication complete response:', loginCompleteResponse.data);
 
-            setMessage('Login successful with security key!');
-            setCurrentUser({
-                id: loginCompleteResponse.data.user_id,
-                username,
-                firstName: loginCompleteResponse.data.firstName,
-                lastName: loginCompleteResponse.data.lastName
-            });
-            setUseFido(true);  // If they logged in with WebAuthn, they definitely have a security key
+            // Only set as fully authenticated if it was a second factor after password
+            if (passwordAuthenticated) {
+                setMessage('Login successful! Both password and security key verified.');
+                setCurrentUser({
+                    id: loginCompleteResponse.data.user_id,
+                    username,
+                    firstName: loginCompleteResponse.data.firstName,
+                    lastName: loginCompleteResponse.data.lastName
+                });
+                setUseFido(true);
+                setPendingSecondFactor(false);
+            } else {
+                // This shouldn't happen with our new flow, but handle it just in case
+                setError('Please enter your password first before using your security key.');
+            }
         } catch (err) {
             console.error('WebAuthn authentication error:', err);
             if (err.name === 'AbortError') {
@@ -199,6 +237,65 @@ const Auth = () => {
             } else {
                 setError(err.response?.data?.error || 'Security key authentication failed');
             }
+            setPendingSecondFactor(false);
+            setPasswordAuthenticated(false);
+        }
+    };
+
+    // Special function specifically for security key authentication after password verification
+    const handleWebAuthnLoginAfterPassword = async () => {
+        resetMessages();
+
+        try {
+            // Step 1: Begin authentication with secondFactor explicitly set to true
+            console.log('Sending WebAuthn login begin request after password verification');
+
+            const loginBeginResponse = await axios.post(`${API_URL}/webauthn/login/begin`, {
+                username,
+                secondFactor: true  // Explicitly set to true
+            });
+
+            console.log('Authentication begin response:', loginBeginResponse.data);
+
+            const options = loginBeginResponse.data.publicKey;
+
+            console.log('Server-sent challenge for login:', options.challenge);
+
+            // Step 2: Call WebAuthn browser API
+            const assertion = await startAuthentication(options);
+            console.log('Authentication response:', assertion);
+
+            // Step 3: Complete authentication on the server
+            console.log('Sending WebAuthn login complete request after password verification');
+
+            const loginCompleteResponse = await axios.post(`${API_URL}/webauthn/login/complete`, {
+                username,
+                assertionResponse: assertion,
+                secondFactor: true  // Explicitly set to true
+            });
+
+            console.log('Authentication complete response:', loginCompleteResponse.data);
+
+            setMessage('Login successful! Both password and security key verified.');
+            setCurrentUser({
+                id: loginCompleteResponse.data.user_id,
+                username,
+                firstName: loginCompleteResponse.data.firstName,
+                lastName: loginCompleteResponse.data.lastName
+            });
+            setUseFido(true);
+            setPendingSecondFactor(false);
+        } catch (err) {
+            console.error('WebAuthn authentication error:', err);
+            if (err.name === 'AbortError') {
+                setError('Authentication was aborted, possibly because you cancelled it');
+            } else if (err.name === 'NotAllowedError') {
+                setError('Authentication was not allowed. Did you use the correct security key?');
+            } else {
+                setError(err.response?.data?.error || 'Security key authentication failed');
+            }
+            setPendingSecondFactor(false);
+            setPasswordAuthenticated(false);
         }
     };
 
@@ -225,6 +322,8 @@ const Auth = () => {
         setFirstName('');
         setLastName('');
         setUseFido(false);
+        setPendingSecondFactor(false);
+        setPasswordAuthenticated(false);
     };
 
     return (
@@ -257,6 +356,32 @@ const Auth = () => {
                         className="btn-secondary w-full mt-4"
                     >
                         Logout
+                    </button>
+                </div>
+            ) : pendingSecondFactor ? (
+                <div className="space-y-4">
+                    <div className="p-4 bg-blue-100 rounded">
+                        <p className="text-blue-800 font-medium">Password verified for {username}</p>
+                        <p className="text-blue-700 text-sm mt-2">Please insert your security key and tap it when prompted.</p>
+                    </div>
+                    <div className="flex justify-center">
+                        <div className="animate-pulse text-6xl">🔑</div>
+                    </div>
+                    <button
+                        onClick={handleWebAuthnLoginAfterPassword}
+                        className="btn-primary w-full"
+                    >
+                        Verify with Security Key
+                    </button>
+                    <button
+                        onClick={() => {
+                            setPendingSecondFactor(false);
+                            setPasswordAuthenticated(false);
+                            resetMessages();
+                        }}
+                        className="btn-secondary w-full"
+                    >
+                        Cancel
                     </button>
                 </div>
             ) : (
@@ -347,27 +472,13 @@ const Auth = () => {
                                         required
                                     />
                                 </div>
-                                <button type="submit" className="btn-primary w-full">Login with Password</button>
-                            </form>
-
-                            <div className="mt-4">
-                                <div className="relative">
-                                    <div className="absolute inset-0 flex items-center">
-                                        <div className="w-full border-t border-gray-300"></div>
-                                    </div>
-                                    <div className="relative flex justify-center text-sm">
-                                        <span className="px-2 bg-white text-gray-500">Or</span>
-                                    </div>
-                                </div>
-
-                                <button
-                                    onClick={handleWebAuthnLogin}
-                                    className="mt-4 w-full flex items-center justify-center bg-gray-100 text-gray-800 font-bold py-2 px-4 rounded hover:bg-gray-200 focus:outline-none focus:ring-2 focus:ring-athens-accent focus:ring-opacity-50 transition-colors"
-                                >
-                                    <span className="mr-2">🔑</span>
-                                    Login with Security Key
+                                <button type="submit" className="btn-primary w-full">
+                                    Continue with Password
                                 </button>
-                            </div>
+                                <p className="text-xs text-center text-gray-500 mt-1">
+                                    After password verification, you'll be prompted to use your security key
+                                </p>
+                            </form>
 
                             <p className="mt-4 text-center text-sm text-gray-600">
                                 Need an account?{' '}
